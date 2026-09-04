@@ -1,6 +1,6 @@
 # 通过 API 操作 UGREEN NAS 内置迅雷应用
 
-> **字太多不看？翻到最下面看[懒人版](#10-懒人版照着复制就行)。**
+> **字太多不看？翻到最下面看[懒人版](#11-懒人版照着复制就行)。**
 > **但至少看看[安全模型](#1-安全模型)一章，以防隐私泄露和安全问题。**
 > **看不懂的话可以把全文喂给 AI，让它一步步教你。**
 
@@ -182,15 +182,55 @@ sudo /bin/ugacltool addace "${MOUNT_POINT}" "user:1001:allow:rwxpdDaARWc--:-fd-"
 sudo /bin/ugacltool getace "${MOUNT_POINT}" | grep 'user:1001'
 ```
 
-## 6. 步骤 5：提交下载任务
+## 6. 解析下载空间与目标目录（提交任务的前提）
+
+提交任务前必须先拿到两个值：下载空间 `target` 和目标目录的 `parent_folder_id`。这两值每台机器都不一样，也不能凭直觉拼，只能查出来。本节是步骤 5（第 7 节）的前置，懒人版里只是把它压缩成了两条命令。
+
+### 6.1 `device/info/watch`：一次拿到 target 与迅雷默认下载目录
 
 ```bash
-# 6.1 拿本地空间 target（形如 <device_id>#...）
+curl -s -X POST "${BASE}/device/info/watch?space=$(printf %s "$SPACE" | jq -sRr @uri)" \
+  -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}" -d '{}' | jq '{target, downloads}'
+```
+
+| 返回字段 | 含义 | 用途 |
+|---|---|---|
+| `target` | 本地下载空间标识，形如 `<device_id>#...` | 填进任务的 `space` 与 `params.target` |
+| `downloads[0].path` | 迅雷自己的默认下载目录（宿主绝对路径，如 `${XUNLEI_DEFAULT}`） | 不自定义目录时的落盘位置 |
+
+一个很容易踩的混淆：`device-space: DEVICESPACE:1000` 是固定常量、只放 header；`space` 是这台机器的空间 id、必须来自 `target`。把 `DEVICESPACE:1000` 当 `space` 用会得到 `code:1005`。
+
+### 6.2 `parent_folder_id`：三级回退解析
+
+迅雷只认它自己设备树里的目录，所以要把宿主路径翻译成 folder id。实测的解析优先级从高到低：
+
+1. **手工配置值**：你已经知道步骤 3 挂载返回的 `file_id`，直接用，跳过下面两步。
+2. **挂载表匹配**：查 `device/v1/vfs`，找 `config.mount_path` 等于目标路径的条目取 `file_id`，再用 `GET drive/v1/files/{file_id}` 校验返回的 `params.RealPath` 确实等于目标路径，避免挂载表陈旧。
+3. **顶层文件树匹配**：查 `drive/v1/files`，遍历结果按 `params.RealPath` 匹配。
+
+```bash
+# 途径 2：挂载表（列表键是 files，不是 items；个别固件返回 items/mounts，见第 9 节 list_mounts()）
+curl -s "${BASE}/device/v1/vfs" -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}" \
+  | jq -r '.files[]? | "\(.file_id)\t\(.config.mount_path)"'
+
+# 途径 3：顶层目录树，按 RealPath 匹配目标目录
+FILTER=$(jq -cn '{kind:{eq:"drive#folder"}}' | jq -sRr @uri)
+curl -s "${BASE}/drive/v1/files?space=${TARGET}&limit=100&parent_id=&filters=${FILTER}&with=withCategoryDownloadPath%2CwithCategoryDiskMountPath" \
+  -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}" \
+  | jq -r --arg p "${MOUNT_POINT%/}" '.files[]? | select(((.params.RealPath // "") | sub("/$";"")) == $p) | .id'
+```
+
+三条途径都拿不到 id，说明该目录没挂进迅雷设备树（回步骤 3）或没给 `thunder` 用户授权（回步骤 4），而不是接口坏了。第 9 节 Python 客户端的 `folder_id_for_path()` 就是这套三级回退的实现。
+
+## 7. 步骤 5：提交下载任务
+
+```bash
+# 7.1 拿本地空间 target（形如 <device_id>#...，见第 6 节）
 TARGET=$(curl -s -X POST "${BASE}/device/info/watch?space=$(printf %s "$SPACE" | jq -sRr @uri)" \
   -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}" -d '{}' | jq -r '.target')
 echo "target=${TARGET}"
 
-# 6.2 提交 URL 到指定目录
+# 7.2 提交 URL 到指定目录
 curl -s -X POST "${BASE}/drive/v1/task?pan_auth=${UIAUTH}&device_space=${SPACE}" \
   -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}" -H "Content-Type: application/json" \
   -d '{
@@ -213,11 +253,11 @@ curl -s -X POST "${BASE}/drive/v1/task?pan_auth=${UIAUTH}&device_space=${SPACE}"
 
 成功判据：响应 `HttpStatus == 0`。**`space` 和 `params.target` 必须都填 `target` 的值（`device_id#...`），并且与 `params.parent_folder_path` 指向同一位置，否则报 `code:1005`** —— 该码字面像缺 Cookie，实际是 space 填错。
 
-不填 `parent_folder_id` / `parent_folder_path` 时，回退到 `${XUNLEI_DEFAULT}` 与顶层目录发现。
+不填 `parent_folder_id` / `parent_folder_path` 时，回退到 `downloads[0].path`（即 `${XUNLEI_DEFAULT}`）与第 6.2 节的目录发现。
 
 **关于每日配额：** 迅雷免费账号在 Web UI 上有每日任务数限制，但**实测通过本文 API 直连提交可以绕过该配额**，适合批量投递。因此批量任务不必再为省配额而排队，请自行留意磁盘容量与带宽。
 
-## 7. 任务查询与控制
+## 8. 任务查询与控制
 
 ```bash
 # 列表。phase 过滤值：PENDING / RUNNING / PAUSED / ERROR / COMPLETE
@@ -236,16 +276,37 @@ curl -s -X POST "${BASE}/method/patch/drive/v1/task" \
   -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}" -H "Content-Type: application/json" \
   -d '{"set_params":{"spec":{"phase":"pause"}}}'      # 恢复用 "running"
 
-# 删任务并删文件：PATCH action=delete
-
-# 删任务但保留文件（只对已完成任务安全）
+# 删任务、保留文件：DELETE（只对已完成任务安全）
 curl -s -X DELETE "${BASE}/drive/v1/tasks?task_ids=<ID>&pan_auth=${UIAUTH}" \
   -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}"
+
+# 删任务、连文件一起删：同一伪方法路由加 action=delete
+curl -s -X POST "${BASE}/method/patch/drive/v1/task?action=delete&pan_auth=${UIAUTH}" \
+  -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}" -H "Content-Type: application/json" \
+  -d '{"task_ids":"<ID>"}'
 ```
 
-两个坑：进行中的任务用 `DELETE` 会**连文件一起删**；多个 `task_ids` 要重复该参数，逗号分隔返回 `invalid_argument`。
+两种删除语义完全不同，别用错：
 
-## 8. Python 客户端 `ugreen_thunder.py`
+| 目的 | 调用 | 前提 | 磁盘上的文件 |
+|---|---|---|---|
+| 清任务记录、留成品 | `DELETE /drive/v1/tasks?task_ids=<ID>` | 任务必须是 `COMPLETE` | **保留** |
+| 连文件一起清掉 | `PATCH` 伪方法路由 + `action=delete` | 已完成任务 | 删除 |
+| 对进行中任务执行 `DELETE` | 不要用 | — | **会被一起删掉** |
+
+也就是说，批量脚本跑完之后的正常清理姿势就是：等任务到 `COMPLETE`，再 `DELETE`，文件留在 `${MOUNT_POINT}` 里。想删文件才走 `action=delete`。
+
+清理后自查（两条都应成立）：
+
+```bash
+ls -l "${MOUNT_POINT}"                                    # 文件还在
+curl -s "${BASE}/drive/v1/tasks?space=${TARGET}&limit=100&pan_auth=${UIAUTH}&device_space=${SPACE}" \
+  -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}" | grep -c '<ID>'   # 期望 0，任务记录已消失
+```
+
+两个坑：先查 `COMPLETE` 再 `DELETE`，进行中任务删不得；多个 `task_ids` 要重复该参数，逗号分隔返回 `invalid_argument`。`action=delete` 的请求体字段名各固件版本略有差异，首次使用请拿一个自己造的测试任务验证，不要直接对真实任务下手。
+
+## 9. Python 客户端 `ugreen_thunder.py`
 
 ```python
 """UGREEN NAS 内置迅雷应用 API 客户端（仅依赖 requests）。
@@ -444,10 +505,26 @@ class UgreenThunder:
         return resp.json()
 
     def delete_task_keep_file(self, task_ids: list) -> dict:
-        """仅对已完成任务安全；进行中删除会连带删文件。多 id 重复参数，逗号分隔报 invalid_argument。"""
+        """删任务记录、保留磁盘文件。仅对已完成任务安全。
+
+        对进行中任务执行 DELETE 会连文件一起删，所以先确认 phase 是 COMPLETE。
+        多个 id 要重复 task_ids 参数，逗号分隔报 invalid_argument。
+        """
         resp = self.s.delete(f"{self.base_url}/drive/v1/tasks",
                              params=[("task_ids", t) for t in task_ids] + list(self._auth_params().items()),
                              headers=self._headers(), timeout=TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+
+    def delete_task_and_file(self, task_id: str) -> dict:
+        """删任务并删掉已下载的文件：走同一伪方法路由，额外带 action=delete。
+
+        请求体字段名各固件版本略有差异，先在自造的测试任务上验证再用。
+        """
+        resp = self.s.post(f"{self.base_url}/method/patch/drive/v1/task",
+                           params={**self._auth_params(), "action": "delete"},
+                           json={"task_ids": task_id},
+                           headers=self._headers(), timeout=TIMEOUT)
         resp.raise_for_status()
         return resp.json()
 
@@ -471,7 +548,7 @@ if __name__ == "__main__":
         print("下载中:", p.get("real_path"), p.get("speed"), task.get("file_size"))
 ```
 
-## 9. Python token 自动续期 `thunder_token_daemon.py`
+## 10. Python token 自动续期 `thunder_token_daemon.py`
 
 pan-auth 约 3 天过期且没有刷新接口。常态化运行时把它写进本地缓存，业务侧只读缓存，避免每次提交都抓页面；nginx 密钥头也集中在这个进程里，不必散落到各处。
 
@@ -626,7 +703,7 @@ python thunder_token_daemon.py
 
 `POLL_INTERVAL`、`REFRESH_INTERVAL` 属经验值，不是协议要求。
 
-## 10. 懒人版：照着复制就行
+## 11. 懒人版：照着复制就行
 
 SSH 进 NAS 执行，把开头三个占位符换掉，其余原样粘贴。每步后面紧跟验证命令，看到预期输出再继续。
 
@@ -697,9 +774,9 @@ curl -s -X POST "${BASE}/drive/v1/task?pan_auth=${UIAUTH}&device_space=${SPACE}"
 ls -l "${MOUNT_POINT}"
 ```
 
-懒人版收尾提醒：测试 URL 换成任意可下载的直链即可；API 直提不受免费账号每日配额限制，但请留意磁盘容量；`space` 里的 `:` 无需转义；跑通之后如果不想每次手工抓 token，回去看第 9 节的续期脚本。
+懒人版收尾提醒：测试 URL 换成任意可下载的直链即可；API 直提不受免费账号每日配额限制，但请留意磁盘容量；`space` 里的 `:` 无需转义；第 5 步里 `TARGET` 的来历见第 6 节，`FILE_ID` 来自步骤 3 的挂载响应；跑通之后如果不想每次手工抓 token，回去看第 10 节的续期脚本。
 
-## 11. 故障排查
+## 12. 故障排查
 
 | 现象 | 原因与处理 |
 |---|---|
@@ -709,13 +786,14 @@ ls -l "${MOUNT_POINT}"
 | 找不到 pan-auth | 首页结构随固件变过。用 `curl -s "${BASE}/raw/"` 抓下页面后搜 `uiauth`，看 token 实际嵌法 |
 | `code:1005` | `space` 填错，不是缺 Cookie。`space` 和 `params.target` 都要用 `device_id#...` 形式 |
 | 目录能挂但列不出来 | 漏了步骤 4。必须用 `ugacltool addace`，`setfacl` 无效；确认抄的是 `user:1001` 那条而非 `user:1000` |
-| 任务没落到指定目录 | 定位靠 `parent_folder_id` / `parent_folder_path`，不是改迅雷默认目录。校验 folder id 的 `RealPath` |
+| 任务没落到指定目录 | 定位靠 `parent_folder_id` / `parent_folder_path`，不是改迅雷默认目录。按第 6.2 节校验 folder id 的 `RealPath` |
 | 提交任务静默找不到目录 | 读了 `items` 键；接口返回的是 `files` |
+| 执行 `DELETE` 之后文件不见了 | 该任务当时还没到 `COMPLETE`。已完成任务 `DELETE` 才保留文件；要连文件一起删请用 `action=delete`（第 8 节） |
 | 文件落成 `xxx(1).mp4` | 目标目录已有同名文件，迅雷加 `(1)` 后缀而不覆盖 |
 | 任务状态不更新 | 列表接口 `expires_in` 缓存，滞后 1~3 秒 |
-| 跑几天后全部请求失败 | pan-auth 过期（约 3 天）。启用第 9 节的续期进程或方案 C 的 cron |
+| 跑几天后全部请求失败 | pan-auth 过期（约 3 天）。启用第 10 节的续期进程或方案 C 的 cron |
 
-## 12. 已知限制
+## 13. 已知限制
 
 - 实测机型 DH4300 Plus。其他机型的 nginx conf 路径、uid、迅雷默认目录名可能不同，以 `getace` 与 `/etc/passwd` 的实际输出为准。
 - `pan-auth` 约 3 天过期且无刷新接口，需定期重取（方案 A/B 自动，方案 C 靠 cron）。
