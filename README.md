@@ -1,6 +1,6 @@
 # 通过 API 操作 UGREEN NAS 内置迅雷应用
 
-> **字太多不看？翻到最下面看[懒人版](#11-懒人版照着复制就行)。**
+> **字太多不看？翻到最下面看[懒人版](#11-懒人版照着复制就行)。**详细版负责说明原理~
 > **但至少看看[安全模型](#1-安全模型)一章，以防隐私泄露和安全问题。**
 > **看不懂的话可以把全文喂给 AI，让它一步步教你。**
 
@@ -25,17 +25,18 @@ MOUNT_POINT="<宿主机上的下载目录>"       # 例:/volume1/Downloads/（�
 
 迅雷应用本身只靠 `pan-auth` 一个 JWT 鉴权，`device-space` 是公开常量。谁持有有效 token，谁就能读写这个下载空间。整套方案的安全边界完全取决于**你用什么方式让脚本拿到 token**，而不是 token 本身有多强。
 
-风险面：持有有效 token 即可列目录（读到你的下载清单）、提交任意 URL、删除任务（含删文件）。**注意：走本文 API 直接提交不受迅雷免费账号的每日任务配额约束，也就是说一旦被外人拿到 token，灌满你的磁盘没有配额这道兜底。** 因此必须确认 `${NAS_PORT}` 没有被端口转发、UPnP 或反向代理导出到公网。**若已导出，方案 A 等同于把迅雷开放给互联网，请只用方案 B 或 C。**
+**风险面：持有有效 token 即可列目录（读到你的下载清单）、提交任意 URL、删除任务（含删文件）。** 因此必须确认 `${NAS_PORT}` 没有被端口转发、UPnP 或反向代理暴露到公网。**若已暴露，方案 A 等同于把迅雷开放给互联网，请只用方案 B 。**
 
 | 方案 | 做法 | 谁能取到 token | 适用 |
 |---|---|---|---|
-| C（最安全） | NAS 本机 cron/定时任务抓 token 写文件，只读挂载进容器 | 只有 NAS 本机进程与挂载该文件的容器 | 服务跑在 NAS 上的容器里 |
-| B（折中） | 加 `raw/` 入口 + 密钥头 + IP 白名单 | 仅白名单内且持密钥的调用方 | 局域网内可控环境 |
+| B（最安全） | 加 `raw/` 入口 + 密钥头 + IP 白名单 | 仅白名单内且持密钥的调用方 | 局域网内可控环境 |
 | A（最省事） | 裸加 `raw/` location | 任何能访问 `${NAS_PORT}` 的设备 | 完全隔离的可信内网 |
 
 ## 2. 步骤 1：准备免会话的 token 入口
 
 `GET ${BASE}/` 会被绿联会话校验拦截，没有浏览器 Cookie 时返回 `code:1024 Login expired`，而 token 就嵌在这个首页里。按上表选一个方案。
+
+> PS: 如果不想一直用 sudo 的话可以 sudo su，输入自己的密码（和 ssh 连接时用的密码相同），即可切换到root用户
 
 ### 方案 A：裸 `raw/` 入口（仅可信内网）
 
@@ -58,18 +59,11 @@ curl -s "${BASE}/raw/" | head -c 300     # 应返回 HTML，不是 Login expired
 
 ### 方案 B：`raw/` 入口 + 密钥头 + IP 白名单（推荐）
 
-默认配置下的可达性矩阵（容器网络以 `docker-compose.yml` 的默认 bridge 网段为例）：
-
-| 调用方 | 能否取 token | 说明 |
-|---|---|---|
-| NAS 本机进程（`127.0.0.1`） | 能 | 需带密钥头 |
-| NAS 上的 Docker 容器 | 能 | 默认 bridge 网段 `172.16.0.0/12`；compose 自定义网络落在此段内，若改过 `subnet` 要同步改 `allow` |
-| 绿联系统自带的迅雷 Web UI | 不受影响 | 走原有会话鉴权，本 location 是精确匹配，不改变其行为 |
-| 局域网里其他电脑上的脚本 | **不能** | 被 `deny all` 拦下。要在 PC 上直接跑，把 `allow` 加上该 PC 的 IP |
-| 公网 | **不能** | 除非你已把 `${NAS_PORT}` 导出，此时仅多一道密钥头 |
+可访问：携带密钥<RAW_KEY>的本机进程与容器
+不可访问：局域网的其他设备（除非手动放开注释的配置），公网的任何客户端
 
 ```bash
-RAW_KEY="$(openssl rand -hex 24)"; echo "记住这个密钥: ${RAW_KEY}"
+RAW_KEY="$(openssl rand -hex 24)"; echo "记住这个密钥: ${RAW_KEY}" # 记不住也没关系，cat一下配置文件就行
 
 sudo tee -a /etc/nginx/conf.d/xunlei_serv.conf > /dev/null <<EOF
 location = /ugreen/v1/thunder/raw/ {
@@ -90,32 +84,6 @@ curl -s -H "X-Thunder-Raw-Key: ${RAW_KEY}" "${BASE}/raw/" | head -c 300    # 期
 
 > 密钥头只保护 `raw/` 这一个 URL。取到 token 之后调 `drive/v1/*` 不受此限制，因为那些接口本来只认 `pan-auth`。
 
-### 方案 C：不碰 nginx，由 NAS 本机投喂 token
-
-可访问：只有 NAS 本机与挂载了该文件的容器。对外零新增暴露面。
-不可访问：局域网其他机器（需要 token 时得从 NAS 上取文件）。
-
-```bash
-mkdir -p /etc/thunder-token && chmod 700 /etc/thunder-token
-
-cat > /usr/local/bin/refresh-thunder-token.sh <<'EOF'
-#!/bin/sh
-curl -s http://127.0.0.1:5050/ \
-  | grep -oP 'function\s+uiauth\([^)]*\)\s*\{\s*return\s*"\K[^"]+' \
-  > /etc/thunder-token/pan_auth.tmp && mv /etc/thunder-token/pan_auth.tmp /etc/thunder-token/pan_auth
-chmod 600 /etc/thunder-token/pan_auth
-EOF
-chmod +x /usr/local/bin/refresh-thunder-token.sh
-/usr/local/bin/refresh-thunder-token.sh          # 先手工跑一次，确认文件非空
-head -c 32 /etc/thunder-token/pan_auth
-
-(crontab -l 2>/dev/null; echo '0 */6 * * * /usr/local/bin/refresh-thunder-token.sh') | crontab -
-```
-
-容器侧只读挂载：`-v /etc/thunder-token/pan_auth:/run/secrets/pan_auth:ro`。
-
-> 若 `/etc/nginx/conf.d/xunlei_serv.conf` 不存在，用 `sudo grep -rl "127.0.0.1:5050" /etc/nginx/` 定位实际承载迅雷反代的 conf。NAS 开了 HTTPS 时 `BASE` 改 `https://`，自签证书给 curl 加 `-k`。部分机型 `/bin/sh` 无 crontab，方案 C 可改用绿联「计划任务」UI 调同一个脚本。
-
 ---
 
 ## 3. 步骤 2：取 pan-auth
@@ -127,15 +95,21 @@ function uiauth() { return "eyJhbGciOi..." }   // 引号里的值就是 pan-auth
 ```
 
 ```bash
+# 方案 A
 UIAUTH=$(curl -s "${BASE}/raw/" \
   | grep -oP 'function\s+uiauth\([^)]*\)\s*\{\s*return\s*"\K[^"]+')
+
+#方案 B
+UIAUTH=$(curl -H "X-Thunder-Raw-Key: ${RAW_KEY}" -s "${BASE}/raw/" \
+  | grep -oP 'function\s+uiauth\([^)]*\)\s*\{\s*return\s*"\K[^"]+')
+
 echo "${UIAUTH:0:24}..."
 ```
 
 方案 B 加 `-H "X-Thunder-Raw-Key: ${RAW_KEY}"`；方案 C 改成 `UIAUTH=$(cat /etc/thunder-token/pan_auth)`。
-手工兜底：浏览器打开迅雷 → DevTools → Network → 任意 XHR → Request Headers 里的 `pan-auth`。
+手工兜底：浏览器打开迅雷 →f12 打开 DevTools → Network放着 → 迅雷创建任务 → Network里面过滤一下“drive/v1/task” → 任意一个 Request Headers 里的 `pan-auth`。
 
-token 有效期约 3 天且无刷新接口，不要长期缓存。后续请求统一带：
+token 有效期约 3 天且无刷新接口，不要长期缓存，**后面会讲如何脚本自动刷新**。后续请求统一带：
 
 ```bash
 -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}"
@@ -149,6 +123,9 @@ token 有效期约 3 天且无刷新接口，不要长期缓存。后续请求�
 curl -s -X POST "${BASE}/device/v1/vfs" \
   -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}" -H "Content-Type: application/json" \
   -d "{\"type\":\"mount_fs\",\"config\":{\"mount_path\":\"${MOUNT_POINT}\"}}"
+# 预期返回 {"code":x,"message":"ok"}，其中"code"后面的值x就是 file_id
+
+FILE_ID="<把上一步的 file_id x 粘这里>"
 ```
 
 成功响应里带 `file_id`，它就是提交任务时用的 `parent_folder_id`，记下来。
@@ -176,7 +153,7 @@ DH4300 Plus 实测输出（其他机型 uid 排列可能不同，以你自己的
 从上例第 `[1]` 行取出的 ACE 字符串即 `user:1001:allow:rwxpdDaARWc--:-fd-`。`1001` 是迅雷应用运行用户 `thunder` 的 uid（别抄成相邻的 `user:1000`；要确认本机 uid 可 `grep -E 'thunder|xunlei' /etc/passwd`）。结尾 `-fd-` 是继承标志，照抄别改。
 
 ```bash
-sudo /bin/ugacltool addace "${MOUNT_POINT}" "user:1001:allow:rwxpdDaARWc--:-fd-"
+sudo /bin/ugacltool addace "${MOUNT_POINT}" "<your_user_uid>" #就是上面抄下来的字符串
 
 # 验证已生效
 sudo /bin/ugacltool getace "${MOUNT_POINT}" | grep 'user:1001'
@@ -191,6 +168,7 @@ sudo /bin/ugacltool getace "${MOUNT_POINT}" | grep 'user:1001'
 ```bash
 curl -s -X POST "${BASE}/device/info/watch?space=$(printf %s "$SPACE" | jq -sRr @uri)" \
   -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}" -d '{}' | jq '{target, downloads}'
+# 不用复制target，第7章会直接通过一整条指令赋值~
 ```
 
 | 返回字段 | 含义 | 用途 |
@@ -204,23 +182,19 @@ curl -s -X POST "${BASE}/device/info/watch?space=$(printf %s "$SPACE" | jq -sRr 
 
 迅雷只认它自己设备树里的目录，所以要把宿主路径翻译成 folder id。实测的解析优先级从高到低：
 
-1. **手工配置值**：你已经知道步骤 3 挂载返回的 `file_id`，直接用，跳过下面两步。
+1. **手工配置值**：你已经知道步骤 3 挂载返回的 `file_id`（这个值只在第一次配置的时候出现），**直接用其作为 parent_folder_id，跳过下面的步骤**。
 2. **挂载表匹配**：查 `device/v1/vfs`，找 `config.mount_path` 等于目标路径的条目取 `file_id`，再用 `GET drive/v1/files/{file_id}` 校验返回的 `params.RealPath` 确实等于目标路径，避免挂载表陈旧。
-3. **顶层文件树匹配**：查 `drive/v1/files`，遍历结果按 `params.RealPath` 匹配。
 
 ```bash
-# 途径 2：挂载表（列表键是 files，不是 items；个别固件返回 items/mounts，见第 9 节 list_mounts()）
-curl -s "${BASE}/device/v1/vfs" -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}" \
-  | jq -r '.files[]? | "\(.file_id)\t\(.config.mount_path)"'
-
-# 途径 3：顶层目录树，按 RealPath 匹配目标目录
-FILTER=$(jq -cn '{kind:{eq:"drive#folder"}}' | jq -sRr @uri)
-curl -s "${BASE}/drive/v1/files?space=${TARGET}&limit=100&parent_id=&filters=${FILTER}&with=withCategoryDownloadPath%2CwithCategoryDiskMountPath" \
+# 挂载表，查看你想挂载的路径前面的id是什么，将其作为 file_id，如果查不到就走途径 3
+curl -s "${BASE}/device/v1/vfs" \
   -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}" \
-  | jq -r --arg p "${MOUNT_POINT%/}" '.files[]? | select(((.params.RealPath // "") | sub("/$";"")) == $p) | .id'
+  | jq -r '(.vfs_list // .files // .items // .mounts // [])[]? | "\(.file_id // .id)\t\(.config.mount_path // .mount_path)"'
+  
+FILE_ID="<上面查到的想要挂载路径对应的id>"
 ```
 
-三条途径都拿不到 id，说明该目录没挂进迅雷设备树（回步骤 3）或没给 `thunder` 用户授权（回步骤 4），而不是接口坏了。第 9 节 Python 客户端的 `folder_id_for_path()` 就是这套三级回退的实现。
+两条途径都拿不到 id，说明该目录没挂进迅雷设备树（回步骤 3）或没给 `thunder` 用户授权（回步骤 4），而不是接口坏了。第 9 节 Python 客户端的 `folder_id_for_path()` 就是这套三级回退的实现。
 
 ## 7. 步骤 5：提交下载任务
 
@@ -235,15 +209,15 @@ curl -s -X POST "${BASE}/drive/v1/task?pan_auth=${UIAUTH}&device_space=${SPACE}"
   -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}" -H "Content-Type: application/json" \
   -d '{
     "type": "user#download-url",
-    "name": "demo.mp4",
-    "file_name": "demo.mp4",
+    "name": "test.dat",
+    "file_name": "test.dat",
     "file_size": "0",
     "space": "'"$TARGET"'",
     "params": {
       "target": "'"$TARGET"'",
-      "url": "https://example.com/demo.mp4",
+      "url": "https://proof.ovh.net/files/1Mb.dat",
       "total_file_count": "1",
-      "parent_folder_id": "<步骤3的file_id>",
+      "parent_folder_id": "'"$FILE_ID"'",
       "parent_folder_path": "'"$MOUNT_POINT"'",
       "mime_type": "application/octet-stream",
       "file_id": ""
@@ -251,11 +225,9 @@ curl -s -X POST "${BASE}/drive/v1/task?pan_auth=${UIAUTH}&device_space=${SPACE}"
   }'
 ```
 
-成功判据：响应 `HttpStatus == 0`。**`space` 和 `params.target` 必须都填 `target` 的值（`device_id#...`），并且与 `params.parent_folder_path` 指向同一位置，否则报 `code:1005`** —— 该码字面像缺 Cookie，实际是 space 填错。
+成功判据：响应 `HttpStatus == 0`，迅雷界面上可以看到创建的任务`test.dat`，挂载目录可以看到`test.dat.xltd`。**`space` 和 `params.target` 必须都填 `target` 的值（`device_id#...`），并且与 `params.parent_folder_path` 指向同一位置，否则报 `code:1005`** —— 该码字面像缺 Cookie，实际是 space 填错。
 
 不填 `parent_folder_id` / `parent_folder_path` 时，回退到 `downloads[0].path`（即 `${XUNLEI_DEFAULT}`）与第 6.2 节的目录发现。
-
-**关于每日配额：** 迅雷免费账号在 Web UI 上有每日任务数限制，但**实测通过本文 API 直连提交可以绕过该配额**，适合批量投递。因此批量任务不必再为省配额而排队，请自行留意磁盘容量与带宽。
 
 ## 8. 任务查询与控制
 
@@ -707,8 +679,10 @@ python thunder_token_daemon.py
 
 SSH 进 NAS 执行，把开头三个占位符换掉，其余原样粘贴。每步后面紧跟验证命令，看到预期输出再继续。
 
+> PS: 如果不想一直用 sudo 的话可以 sudo su，输入自己的密码（和 ssh 连接时用的密码相同），即可切换到root用户
+
 ```bash
-# ==== 第 0 步：设好这几个变量 ====
+# ==== 第 0 步：设好这几个变量，根据自己的环境和需求配置 ====
 NAS_PORT="9999"                                                   # 默认 9999，改过就填实际值
 XUNLEI_DEFAULT="/volume1/迅雷下载/"                                # 迅雷默认下载目录
 MOUNT_POINT="/volume1/Downloads/"                                 # 你想让文件落的目录
@@ -716,44 +690,52 @@ BASE="http://127.0.0.1:${NAS_PORT}/ugreen/v1/thunder"             # 在 NAS 本�
 ```
 
 ```bash
-# ==== 第 1 步：开 raw/ 免会话入口（更安全做法见正文方案 B/C） ====
-sudo cp /etc/nginx/conf.d/xunlei_serv.conf /etc/nginx/conf.d/xunlei_serv.conf.bak-$(date +%Y%m%d)
-sudo tee -a /etc/nginx/conf.d/xunlei_serv.conf > /dev/null <<'NGINXEOF'
+# ==== 第 1 步：raw/入口 + 密钥头 + IP 白名单（方案 B） ====
+RAW_KEY="$(openssl rand -hex 24)"; echo "记住这个密钥: ${RAW_KEY}"
+
+sudo tee -a /etc/nginx/conf.d/xunlei_serv.conf > /dev/null <<EOF
 location = /ugreen/v1/thunder/raw/ {
+    if (\$http_x_thunder_raw_key != "${RAW_KEY}") { return 403; }
+    allow 127.0.0.1;
+    allow 172.16.0.0/12;      # Docker 默认私有网段，按实际 compose 网络调整
+    # allow <你电脑的局域网IP>;   # 需要在 PC 上直接跑脚本时再放开
+    deny all;
     proxy_pass http://127.0.0.1:5050/;
-    proxy_set_header Host $host;
+    proxy_set_header Host \$host;
 }
-NGINXEOF
+EOF
 sudo nginx -t && sudo nginx -s reload
 
-# ==== 验证 1：应看到 HTML，而不是 Login expired ====
-curl -s "${BASE}/raw/" | head -c 300
+# ==== 验证 1 ====
+curl -s -o /dev/null -w '%{http_code}\n' "${BASE}/raw/"                    # 期望 403
+curl -s -H "X-Thunder-Raw-Key: ${RAW_KEY}" "${BASE}/raw/" | head -c 300    # 期望 HTML
 ```
 
 ```bash
 # ==== 第 2 步：取 pan-auth ====
-UIAUTH=$(curl -s "${BASE}/raw/" | grep -oP 'function\s+uiauth\([^)]*\)\s*\{\s*return\s*"\K[^"]+')
+UIAUTH=$(curl -H "X-Thunder-Raw-Key: ${RAW_KEY}" -s "${BASE}/raw/" \
+  | grep -oP 'function\s+uiauth\([^)]*\)\s*\{\s*return\s*"\K[^"]+')
 
-# ==== 验证 2：打印出 eyJ... 开头即成功 ====
+# ==== 验证 2：打印出 <一堆字母>... 开头即成功 ====
 echo "pan-auth = ${UIAUTH:0:24}..."
 ```
 
 ```bash
 # ==== 第 3 步：把目录挂进迅雷设备树，抓 file_id ====
-curl -s -X POST "${BASE}/device/v1/vfs" \
+FILE_ID=$(curl -H "X-Thunder-Raw-Key: ${RAW_KEY}" -s -X POST "${BASE}/device/v1/vfs" \
   -H "device-space: DEVICESPACE:1000" -H "pan-auth: ${UIAUTH}" -H "Content-Type: application/json" \
-  -d "{\"type\":\"mount_fs\",\"config\":{\"mount_path\":\"${MOUNT_POINT}\"}}"
-# 从上面的输出里复制 file_id 的值，粘到下一行
-FILE_ID="<把上一步的 file_id 粘这里>"
+  -d "{\"type\":\"mount_fs\",\"config\":{\"mount_path\":\"${MOUNT_POINT}\"}}" | jq '.code')
 
 # ==== 验证 3：非空即成功 ====
 echo "file_id = ${FILE_ID}"
+
+# 注意：此file_id仅在第一次挂载的时候出现，后续忘记了见6.2.2找回
 ```
 
 ```bash
 # ==== 第 4 步：授权（ACE 抄迅雷默认目录 getace 输出里 user:1001 那条） ====
-sudo /bin/ugacltool getace "${XUNLEI_DEFAULT}"          # 先看一眼，确认 user:1001 那行内容
-sudo /bin/ugacltool addace "${MOUNT_POINT}" "user:1001:allow:rwxpdDaARWc--:-fd-"
+ACE=$(/bin/ugacltool getace "${XUNLEI_DEFAULT}" | awk '/user:1001:/ {print $2}')
+sudo /bin/ugacltool addace "${MOUNT_POINT}" "${ACE}"
 
 # ==== 验证 4：能 grep 出 user:1001 即已生效 ====
 sudo /bin/ugacltool getace "${MOUNT_POINT}" | grep 'user:1001'
@@ -768,13 +750,13 @@ echo "target = ${TARGET}"
 
 curl -s -X POST "${BASE}/drive/v1/task?pan_auth=${UIAUTH}&device_space=${SPACE}" \
   -H "device-space: ${SPACE}" -H "pan-auth: ${UIAUTH}" -H "Content-Type: application/json" \
-  -d '{"type":"user#download-url","name":"ugreen-api-test.mp4","file_name":"ugreen-api-test.mp4","file_size":"0","space":"'"${TARGET}"'","params":{"target":"'"${TARGET}"'","url":"https://proof.ovh.net/files/1Mb.dat","total_file_count":"1","parent_folder_id":"'"${FILE_ID}"'","parent_folder_path":"'"${MOUNT_POINT}"'","mime_type":"application/octet-stream","file_id":""}}'
+  -d '{"type":"user#download-url","name":"test.dat","file_name":"test.dat","file_size":"0","space":"'"${TARGET}"'","params":{"target":"'"${TARGET}"'","url":"https://proof.ovh.net/files/1Mb.dat","total_file_count":"1","parent_folder_id":"'"${FILE_ID}"'","parent_folder_path":"'"${MOUNT_POINT}"'","mime_type":"application/octet-stream","file_id":""}}'
 
 # ==== 验证 5：响应 HttpStatus 为 0 即成功；再确认文件落地 ====
-ls -l "${MOUNT_POINT}"
+ls -l "${MOUNT_POINT}" | grep test.dat
 ```
 
-懒人版收尾提醒：测试 URL 换成任意可下载的直链即可；API 直提不受免费账号每日配额限制，但请留意磁盘容量；`space` 里的 `:` 无需转义；第 5 步里 `TARGET` 的来历见第 6 节，`FILE_ID` 来自步骤 3 的挂载响应；跑通之后如果不想每次手工抓 token，回去看第 10 节的续期脚本。
+懒人版收尾提醒：测试 URL 换成任意可下载的直链即可；`space` 里的 `:` 无需转义；第 5 步里 `TARGET` 的来历见第 6 节，`FILE_ID` 来自步骤 3 的挂载响应；跑通之后如果不想每次手工抓 token，回去看第 10 节的续期脚本。
 
 ## 12. 故障排查
 
